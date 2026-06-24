@@ -24,6 +24,23 @@ pub enum DataKey {
     TotalStakers,
     TotalRewardsPaid,
     Delegate(Address),
+    // Address that receives slashed tokens. Defaults to admin when not set.
+    SlashTreasury,
+    // Whitelist flag and per-user whitelist mapping for permissioned pools
+    WhitelistEnabled,
+    Whitelisted(Address),
+    // Cooldown period in ledgers for unbonding flow. 0 means instant unstake allowed.
+    CooldownPeriod,
+    // Per-user unbonding position stored when request_unstake is called.
+    UnbondingPosition(Address),
+    PoolCap,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnbondingPosition {
+    pub amount: i128,
+    pub unbonding_since: u32,
 }
 
 #[contracttype]

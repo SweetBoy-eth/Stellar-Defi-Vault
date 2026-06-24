@@ -25,6 +25,8 @@ impl VaultContract {
         admin::set_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Paused, &false);
+        // By default, set the slash treasury to the admin address. Can be updated by admin later.
+        env.storage().instance().set(&DataKey::SlashTreasury, &admin);
         Ok(())
     }
 
@@ -229,6 +231,44 @@ impl VaultContract {
         Ok(())
     }
 
+    /// Admin: set the address that receives slashed tokens. Defaults to admin at initialize.
+    pub fn set_slash_treasury(env: Env, treasury: Address) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::SlashTreasury, &treasury);
+        Ok(())
+    }
+
+    /// Admin: enable or disable staking whitelist. When enabled, only whitelisted addresses may call stake/stake_for.
+    pub fn set_whitelist_enabled(env: Env, enabled: bool) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::WhitelistEnabled, &enabled);
+        Ok(())
+    }
+
+    /// Admin: add address to whitelist
+    pub fn add_to_whitelist(env: Env, user: Address) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Whitelisted(user), &true);
+        Ok(())
+    }
+
+    /// Admin: remove address from whitelist
+    pub fn remove_from_whitelist(env: Env, user: Address) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().persistent().remove(&DataKey::Whitelisted(user));
+        Ok(())
+    }
+
+    /// Read-only: check whether a user is whitelisted
+    pub fn is_whitelisted(env: Env, user: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Whitelisted(user))
+            .unwrap_or(false)
+    }
+
     /// Admin: set the maximum withdrawal limit per transaction (in shares).
     pub fn set_withdrawal_limit(env: Env, limit: i128) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
@@ -239,6 +279,152 @@ impl VaultContract {
         let admin = admin::get_admin(&env)?;
         events::withdrawal_limit_updated(&env, &admin, limit);
         Ok(())
+    }
+
+    /// Admin: set the unbonding cooldown period in ledgers. 0 disables cooldown (instant unstake allowed).
+    pub fn set_cooldown_period(env: Env, ledgers: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::CooldownPeriod, &ledgers);
+        Ok(())
+    }
+
+    /// User-visible: request an unstake which starts the cooldown. The requested amount is removed from active stake and placed into an unbonding position.
+    pub fn request_unstake(env: Env, user: Address, amount: i128) -> Result<(), VaultError> {
+        user.require_auth();
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        // If cooldown is zero, user can call instant unstake directly — we still allow request_unstake to perform instant withdrawal for convenience
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let user_shares = balance::get_shares(&env, &user);
+        if user_shares == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        // compute user's current token-equivalent position
+        let position_amount = balance::shares_to_amount(total_shares, total_deposited, user_shares)
+            .ok_or(VaultError::ArithmeticError)?;
+        if position_amount <= 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        // ensure requested amount <= position_amount
+        let actual_amount = if amount > position_amount { position_amount } else { amount };
+
+        // Crucial: finalize reward accrual up to now so that rewards on the to-be-unbonded principal stop accruing afterwards
+        Self::accrue_rewards(&env, &user, user_shares)?;
+
+        // compute shares to remove corresponding to actual_amount
+        let mut shares_to_remove = balance::amount_to_shares(total_shares, total_deposited, actual_amount)
+            .unwrap_or(user_shares);
+        if shares_to_remove > user_shares {
+            shares_to_remove = user_shares;
+        }
+
+        // compute concrete amount removed based on shares_to_remove (rounding-safe)
+        let amount_removed = balance::shares_to_amount(total_shares, total_deposited, shares_to_remove)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        // update user shares and totals immediately; funds remain in contract until execute_unstake
+        let new_user_shares = user_shares - shares_to_remove;
+        balance::set_shares(&env, &user, new_user_shares);
+        balance::set_total_shares(&env, total_shares - shares_to_remove);
+
+        let new_total_deposited = total_deposited
+            .checked_sub(amount_removed)
+            .ok_or(VaultError::ArithmeticError)?;
+        balance::set_total_deposited(&env, new_total_deposited);
+
+        if new_user_shares == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakedAtLedger(user.clone()));
+            let total_stakers = balance::get_total_stakers(&env);
+            if total_stakers > 0 {
+                balance::set_total_stakers(&env, total_stakers - 1);
+            }
+            events::position_closed(&env, &user);
+        }
+        Self::record_stake_snapshot(&env, &user, new_user_shares);
+
+        // store or merge unbonding position; restart cooldown from now
+        let current_ledger = env.ledger().sequence();
+        let mut existing: UnbondingPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()))
+            .unwrap_or(UnbondingPosition { amount: 0, unbonding_since: 0 });
+        let new_amount = existing.amount + amount_removed;
+        let new_pos = UnbondingPosition { amount: new_amount, unbonding_since: current_ledger };
+        env.storage()
+            .persistent()
+            .set(&DataKey::UnbondingPosition(user.clone()), &new_pos);
+
+        // advance reward checkpoint so no further rewards accrue to the removed shares
+        balance::set_reward_checkpoint_ledger(&env, &user, current_ledger);
+
+        // If cooldown == 0, optionally auto-execute withdrawal immediately
+        if cooldown == 0 {
+            // transfer tokens immediately
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(VaultError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &user, &amount_removed);
+            // remove unbonding position since executed
+            env.storage().persistent().remove(&DataKey::UnbondingPosition(user.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Execute unstake after cooldown has passed. Transfers the pending unbonded amount to the user.
+    pub fn execute_unstake(env: Env, user: Address) -> Result<i128, VaultError> {
+        user.require_auth();
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        let pos_opt: Option<UnbondingPosition> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()));
+        let pos = match pos_opt {
+            Some(p) => p,
+            None => return Err(VaultError::PositionNotFound),
+        };
+        let current_ledger = env.ledger().sequence();
+        if cooldown > 0 {
+            let ready_ledger = pos.unbonding_since.saturating_add(cooldown);
+            if current_ledger < ready_ledger {
+                return Err(VaultError::UseCooldownFlow);
+            }
+        }
+
+        // transfer tokens to user and remove unbonding record
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &user, &pos.amount);
+
+        env.storage().persistent().remove(&DataKey::UnbondingPosition(user.clone()));
+
+        Ok(pos.amount)
+    }
+
+    /// Read-only: get pending unbonding position for a user
+    pub fn pending_unbonding(env: Env, user: Address) -> Result<Option<UnbondingPosition>, VaultError> {
+        let pos_opt: Option<UnbondingPosition> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()));
+        Ok(pos_opt)
     }
 
     /// Query the current withdrawal limit per transaction.
@@ -296,6 +482,26 @@ impl VaultContract {
     pub fn get_min_stake(env: Env) -> Result<i128, VaultError> {
         let _ = admin::get_admin(&env)?;
         Ok(balance::get_min_stake(&env))
+    }
+
+    /// Admin: set the maximum TVL cap (in token units).
+    /// A cap of 0 means no limit.
+    pub fn set_pool_cap(env: Env, cap: i128) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if cap < 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        balance::set_pool_cap(&env, cap);
+        let admin = admin::get_admin(&env)?;
+        events::pool_cap_updated(&env, &admin, cap);
+        Ok(())
+    }
+
+    /// Read-only pool cap value.
+    /// Returns 0 if no cap is set (unlimited).
+    pub fn get_pool_cap(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_pool_cap(&env))
     }
 
     /// Admin: set the base reward APR in basis points.
@@ -474,6 +680,23 @@ impl VaultContract {
             _ => return Err(VaultError::NotADelegate),
         }
 
+        // If whitelist is enabled, ensure beneficiary is whitelisted for new stakes
+        let whitelist_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistEnabled)
+            .unwrap_or(false);
+        if whitelist_enabled {
+            let allowed = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Whitelisted(beneficiary.clone()))
+                .unwrap_or(false);
+            if !allowed {
+                return Err(VaultError::NotWhitelisted);
+            }
+        }
+
         let token_addr: Address = env
             .storage()
             .instance()
@@ -486,6 +709,16 @@ impl VaultContract {
 
         Self::require_min_stake(&env, current_shares, total_shares, total_deposited, amount)?;
         Self::accrue_rewards(&env, &beneficiary, current_shares)?;
+
+        let cap = balance::get_pool_cap(&env);
+        if cap > 0 {
+            let new_total_deposited = total_deposited
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticError)?;
+            if new_total_deposited > cap {
+                return Err(VaultError::PoolCapReached);
+            }
+        }
 
         let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
             .ok_or(VaultError::ArithmeticError)?;
@@ -514,11 +747,115 @@ impl VaultContract {
         Ok(shares)
     }
 
+    /// Admin: slash a user's staked principal. Can be called while paused.
+    /// `admin_addr` must be the admin and is provided to follow existing patterns.
+    /// Returns the actual slashed token amount.
+    pub fn slash(env: Env, admin_addr: Address, user: Address, amount: i128) -> Result<i128, VaultError> {
+        // authorization: caller must be admin (enforced by require_admin)
+        admin::require_admin(&env)?;
+        // admin_addr is an argument (follows other admin methods) but we still check admin auth above
+
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let user_shares = balance::get_shares(&env, &user);
+        if user_shares == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+
+        // compute user's position amount (token units)
+        let position_amount = balance::shares_to_amount(total_shares, total_deposited, user_shares)
+            .ok_or(VaultError::ArithmeticError)?;
+        if position_amount == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        // actual_slash_amount = min(requested, position_amount)
+        let actual = if amount > position_amount { position_amount } else { amount };
+
+        // compute shares to remove corresponding to `actual` (may round)
+        let mut shares_to_remove = balance::amount_to_shares(total_shares, total_deposited, actual)
+            .unwrap_or(user_shares);
+        if shares_to_remove > user_shares {
+            shares_to_remove = user_shares;
+        }
+
+        // token and treasury addresses
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlashTreasury)
+            .ok_or(VaultError::NotInitialized)?;
+
+        // update user shares and totals
+        let new_user_shares = user_shares - shares_to_remove;
+        balance::set_shares(&env, &user, new_user_shares);
+        balance::set_total_shares(&env, total_shares - shares_to_remove);
+
+        let new_total_deposited = total_deposited
+            .checked_sub(actual)
+            .ok_or(VaultError::ArithmeticError)?;
+        balance::set_total_deposited(&env, new_total_deposited);
+
+        if new_user_shares == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakedAtLedger(user.clone()));
+            let total_stakers = balance::get_total_stakers(&env);
+            if total_stakers > 0 {
+                balance::set_total_stakers(&env, total_stakers - 1);
+            }
+            events::position_closed(&env, &user);
+        }
+        Self::record_stake_snapshot(&env, &user, new_user_shares);
+
+        // Reward forfeiture: clear accrued rewards and advance checkpoint so no further claim for pre-slash accrual
+        balance::set_accrued_reward(&env, &user, 0);
+        balance::set_reward_checkpoint_ledger(&env, &user, env.ledger().sequence());
+        balance::set_last_claim_ledger(&env, &user, env.ledger().sequence());
+
+        // transfer slashed tokens from contract to treasury
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &treasury, &actual);
+
+        // emit event
+        let admin_actual = admin::get_admin(&env)?;
+        events::slash(&env, &admin_actual, &user, actual);
+
+        Ok(actual)
+    }
+
     // --- Internal helpers ---
 
     fn do_stake(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
         staker.require_auth();
         Self::require_not_paused(env)?;
+
+        // If whitelist is enabled, reject non-whitelisted stakers. Existing stakers can still unstake/claim.
+        let whitelist_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistEnabled)
+            .unwrap_or(false);
+        if whitelist_enabled {
+            let allowed = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Whitelisted(staker.clone()))
+                .unwrap_or(false);
+            if !allowed {
+                return Err(VaultError::NotWhitelisted);
+            }
+        }
 
         if amount <= 0 {
             return Err(VaultError::ZeroAmount);
@@ -536,6 +873,16 @@ impl VaultContract {
 
         Self::require_min_stake(env, current_shares, total_shares, total_deposited, amount)?;
         Self::accrue_rewards(env, staker, current_shares)?;
+
+        let cap = balance::get_pool_cap(env);
+        if cap > 0 {
+            let new_total_deposited = total_deposited
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticError)?;
+            if new_total_deposited > cap {
+                return Err(VaultError::PoolCapReached);
+            }
+        }
 
         let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
             .ok_or(VaultError::ArithmeticError)?;
@@ -567,6 +914,12 @@ impl VaultContract {
     fn do_unstake(env: &Env, staker: &Address, shares: i128) -> Result<i128, VaultError> {
         staker.require_auth();
         Self::require_not_paused(env)?;
+
+        // If cooldown is enabled, force use of request_unstake/execute_unstake flow
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        if cooldown > 0 {
+            return Err(VaultError::UseCooldownFlow);
+        }
 
         if shares <= 0 {
             return Err(VaultError::ZeroAmount);

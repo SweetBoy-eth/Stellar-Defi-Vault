@@ -46,6 +46,12 @@ pub fn rate_changed(env: &Env, old_rate_bps: u32, new_rate_bps: u32) {
         .publish(topics, (old_rate_bps, new_rate_bps, env.ledger().sequence()));
 }
 
+pub fn pool_cap_updated(env: &Env, admin: &Address, new_cap: i128) {
+    let topics = (symbol_short!("cap_upd"), admin);
+    env.events()
+        .publish(topics, (new_cap, env.ledger().sequence()));
+}
+
 pub fn position_opened(env: &Env, user: &Address, amount: i128) {
     let topics = (symbol_short!("pos_open"), user);
     env.events()
@@ -55,4 +61,10 @@ pub fn position_opened(env: &Env, user: &Address, amount: i128) {
 pub fn position_closed(env: &Env, user: &Address) {
     let topics = (symbol_short!("pos_clos"), user);
     env.events().publish(topics, (env.ledger().sequence(),));
+}
+
+pub fn slash(env: &Env, admin: &Address, user: &Address, amount: i128) {
+    let topics = (symbol_short!("slash"), admin);
+    env.events()
+        .publish(topics, (user.clone(), amount, env.ledger().sequence()));
 }
